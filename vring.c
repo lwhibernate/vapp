@@ -126,29 +126,23 @@ int put_vring(VringTable* vring_table, uint32_t v_idx, void* buf, size_t size)
     unsigned int num = vring_table->vring[v_idx].num;
     ProcessHandler* handler = &vring_table->handler;
 
-    uint16_t f_idx = vring_table->free_head;
+    uint16_t a_idx = vring_table->vring[v_idx].last_avail_idx;
     void* dest_buf = 0;
     struct virtio_net_hdr *hdr = 0;
     size_t hdr_len = sizeof(struct virtio_net_hdr);
 
-    if (f_idx == VRING_IDX_NONE) {
-        //fprintf(stderr, "Vring is full - no room for new packes.\n");
+    if (size > desc[a_idx].len) {
         return -1;
     }
 
-    assert(f_idx>=0 && f_idx<VHOST_VRING_SIZE);
-    if (size > desc[f_idx].len) {
-        return -1;
-    }
-
-    // move free head
-    vring_table->free_head = desc[f_idx].next;
+    // move avail head
+    vring_table->vring[v_idx].last_avail_idx = desc[a_idx].next;
 
     // map the address
     if (handler && handler->map_handler) {
-        dest_buf = (void*)handler->map_handler(handler->context, desc[f_idx].addr);
+        dest_buf = (void*)handler->map_handler(handler->context, desc[a_idx].addr);
     } else {
-        dest_buf = (void*)desc[f_idx].addr;
+        dest_buf = (void*)desc[a_idx].addr;
     }
 
     // set the header to all 0
@@ -162,15 +156,13 @@ int put_vring(VringTable* vring_table, uint32_t v_idx, void* buf, size_t size)
 
     // We support only single buffer per packet
     memcpy(dest_buf + hdr_len, buf, size);
-    desc[f_idx].len = hdr_len + size;
-    desc[f_idx].flags = 0;
-    desc[f_idx].next = VRING_IDX_NONE;
+    desc[a_idx].len = hdr_len + size;
+    desc[a_idx].flags = 0;
+    desc[a_idx].next = VRING_IDX_NONE;
 
     // add to avail
-    avail->ring[avail->idx] = f_idx;
-
-    // move/warp avail.idx to next
-    avail->idx = (avail->idx+1)%num;
+    avail->ring[avail->idx % num] = a_idx;
+    avail->idx++;
 
     sync_shm(dest_buf, size);
     sync_shm((void*)&(avail), sizeof(struct vring_avail));
@@ -181,7 +173,7 @@ int put_vring(VringTable* vring_table, uint32_t v_idx, void* buf, size_t size)
 static int free_vring(VringTable* vring_table, uint32_t v_idx, uint32_t d_idx)
 {
     struct vring_desc* desc = vring_table->vring[v_idx].desc;
-    uint16_t f_idx = vring_table->free_head;
+    uint16_t f_idx = vring_table->vring[v_idx].last_avail_idx;
 
     assert(d_idx>=0 && d_idx<VHOST_VRING_SIZE);
 
@@ -189,7 +181,7 @@ static int free_vring(VringTable* vring_table, uint32_t v_idx, uint32_t d_idx)
     desc[d_idx].len = BUFFER_SIZE;
     desc[d_idx].flags |= VIRTIO_DESC_F_WRITE;
     desc[d_idx].next = f_idx;
-    vring_table->free_head = d_idx;
+    vring_table->vring[v_idx].last_avail_idx = d_idx;
 
     return 0;
 }
@@ -198,13 +190,13 @@ int process_used_vring(VringTable* vring_table, uint32_t v_idx)
 {
     struct vring_used* used = vring_table->vring[v_idx].used;
     unsigned int num = vring_table->vring[v_idx].num;
-    uint16_t u_idx = vring_table->used_head;
+    uint16_t u_idx = vring_table->vring[v_idx].last_used_idx;
 
     for (; u_idx != used->idx; u_idx = (u_idx + 1) % num) {
         free_vring(vring_table, v_idx, used->ring[u_idx].id);
     }
 
-    vring_table->used_head = u_idx;
+    vring_table->vring[v_idx].last_used_idx = u_idx;
 
     return 0;
 }
@@ -216,9 +208,9 @@ static int process_desc(VringTable* vring_table, uint32_t v_idx, uint32_t a_idx)
     struct vring_used* used = vring_table->vring[v_idx].used;
     unsigned int num = vring_table->vring[v_idx].num;
     ProcessHandler* handler = &vring_table->handler;
-    uint16_t u_idx = vring_table->last_used_idx;
+    uint16_t u_idx = vring_table->vring[v_idx].last_used_idx % num;
     uint16_t d_idx = avail->ring[a_idx];
-    uint32_t len = 0;
+    uint32_t i, len = 0;
     size_t buf_size = ETH_PACKET_SIZE;
     uint8_t buf[buf_size];
     struct virtio_net_hdr *hdr = 0;
@@ -228,15 +220,16 @@ static int process_desc(VringTable* vring_table, uint32_t v_idx, uint32_t a_idx)
     fprintf(stdout, "chunks: ");
 #endif
 
+    i=d_idx;
     for (;;) {
         void* cur = 0;
-        uint32_t cur_len = desc[d_idx].len;
+        uint32_t cur_len = desc[i].len;
 
         // map the address
         if (handler && handler->map_handler) {
-            cur = (void*)handler->map_handler(handler->context, desc[d_idx].addr);
+            cur = (void*)handler->map_handler(handler->context, desc[i].addr);
         } else {
-            cur = (void*)desc[d_idx].addr;
+            cur = (void*)desc[i].addr;
         }
 
         if (len + cur_len < buf_size) {
@@ -250,17 +243,20 @@ static int process_desc(VringTable* vring_table, uint32_t v_idx, uint32_t a_idx)
 
         len += cur_len;
 
-        // add it to the used ring
-        used->ring[u_idx].id = d_idx;
-        used->ring[u_idx].len = cur_len;
-        u_idx = (u_idx + 1) % num;
-
-        if (desc[d_idx].flags & VIRTIO_DESC_F_NEXT) {
-            d_idx = desc[d_idx].next;
+        if (desc[i].flags & VIRTIO_DESC_F_NEXT) {
+            i = desc[i].next;
         } else {
             break;
         }
     }
+
+    if (!len){
+        return -1;
+    }
+
+    // add it to the used ring
+    used->ring[u_idx].id = d_idx;
+    used->ring[u_idx].len = len;
 
 #ifdef DUMP_PACKETS
     fprintf(stdout, "\n");
@@ -283,7 +279,7 @@ static int process_desc(VringTable* vring_table, uint32_t v_idx, uint32_t a_idx)
         }
     }
 
-    return u_idx;
+    return 0;
 }
 
 int process_avail_vring(VringTable* vring_table, uint32_t v_idx)
@@ -293,18 +289,23 @@ int process_avail_vring(VringTable* vring_table, uint32_t v_idx)
     unsigned int num = vring_table->vring[v_idx].num;
 
     uint32_t count = 0;
-    uint16_t a_idx = vring_table->last_avail_idx;
-    uint16_t u_idx = vring_table->last_used_idx;
+    uint16_t a_idx = vring_table->vring[v_idx].last_avail_idx % num;
 
     // Loop all avail descriptors
-    for (; a_idx != avail->idx; a_idx = (a_idx + 1) % num) {
-        u_idx = process_desc(vring_table, v_idx, a_idx);
+    for (;;) {
+        /* we reached the end of avail */
+        if (vring_table->vring[v_idx].last_avail_idx == avail->idx) {
+            break;
+        }
+
+        process_desc(vring_table, v_idx, a_idx);
+        a_idx = (a_idx + 1) % num;
+        vring_table->vring[v_idx].last_avail_idx++;
+        vring_table->vring[v_idx].last_used_idx++;
         count++;
     }
 
-    vring_table->last_avail_idx = a_idx;
-    vring_table->last_used_idx = u_idx;
-    used->idx = u_idx;
+    used->idx = vring_table->vring[v_idx].last_used_idx;
 
     return count;
 }

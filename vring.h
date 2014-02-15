@@ -68,6 +68,8 @@ typedef struct {
   struct vring_avail* avail;
   struct vring_used* used;
   unsigned int num;
+  uint16_t last_avail_idx;
+  uint16_t last_used_idx;
 } Vring;
 
 struct VhostUserMemory;
@@ -86,16 +88,7 @@ int set_host_vring(Client* client, struct vhost_vring *vring, int index);
 int set_host_vring_table(struct vhost_vring* vring_table[], size_t vring_table_num, Client* client);
 
 typedef struct {
-    // sender end
-    uint16_t free_head;
-    uint16_t used_head;
-
-    // receiver end
-    uint16_t last_avail_idx;
-    uint16_t last_used_idx;
-
     ProcessHandler handler;
-
     Vring vring[VHOST_CLIENT_VRING_NUM];
 } VringTable;
 
